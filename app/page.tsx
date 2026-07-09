@@ -11,6 +11,10 @@ const SPEECH_WATCHDOG_MAX_MS = 45000;
 const SPEECH_KEEP_ALIVE_MS = 9000;
 const RESUME_STORAGE_KEY = "audioReaderResumeSessions";
 const RESUME_STORAGE_LIMIT = 12;
+const VISIBLE_BEFORE = 80;
+const VISIBLE_AFTER = 180;
+const VISIBLE_EXPAND_STEP = 120;
+const LARGE_FILE_WINDOW_THRESHOLD = 2000;
 const SAMPLE_TEXT = `บทที่ 1 เสียงจากทะเลทราย
 
 ลมร้อนพัดผ่านซากหินสีดำ ขณะที่นักผจญภัยหยุดยืนหน้าประตูโบราณ แสงสีทองค่อย ๆ ไหลไปตามรอยสลักราวกับมันกำลังตื่นจากการหลับใหลยาวนาน
@@ -67,6 +71,25 @@ interface PendingResume {
   displayIndex: number;
   readableIndex: number;
 }
+
+interface VisibleWindow {
+  start: number;
+  end: number;
+  before: number;
+  after: number;
+}
+
+const clampVisibleWindow = (centerIndex: number, total: number, before: number, after: number): VisibleWindow => {
+  if (total <= 0) return { start: 0, end: 0, before, after };
+
+  const safeCenter = Math.max(0, Math.min(total - 1, centerIndex));
+  return {
+    start: Math.max(0, safeCenter - before),
+    end: Math.min(total, safeCenter + after + 1),
+    before,
+    after,
+  };
+};
 
 const blankStats = (): CleanStats => ({
   removedRuleLines: 0,
@@ -224,6 +247,9 @@ export default function AudioReader() {
   const [fileName, setFileName] = useState("");
   const [fileHash, setFileHash] = useState("");
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null);
+  const [visibleWindow, setVisibleWindow] = useState<VisibleWindow>(() =>
+    clampVisibleWindow(0, 0, VISIBLE_BEFORE, VISIBLE_AFTER),
+  );
 
   const readerRef = useRef<HTMLDivElement>(null);
   const speakChunkRef = useRef<(readableIndex: number) => void>(() => {});
@@ -233,6 +259,7 @@ export default function AudioReader() {
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
   const currentReadableIndexRef = useRef(0);
+  const pendingScrollIndexRef = useRef<number | null>(null);
 
   useEffect(() => {
     const loadVoices = () => {
@@ -309,14 +336,42 @@ export default function AudioReader() {
     });
   }, [currentIndex, currentReadableIndex, fileHash, fileName, rate, readableChunks.length, selectedVoice, text.length]);
 
+  const centerVisibleWindow = useCallback((displayIndex: number, shouldScroll = true) => {
+    setVisibleWindow((previous) => clampVisibleWindow(displayIndex, displayChunks.length, previous.before, previous.after));
+    if (shouldScroll) pendingScrollIndexRef.current = displayIndex;
+  }, [displayChunks.length]);
+
   useEffect(() => {
-    const activeElement = readerRef.current?.querySelector(".active-chunk") as HTMLElement | null;
-    activeElement?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [currentIndex]);
+    const targetIndex = pendingScrollIndexRef.current;
+    if (targetIndex === null) return;
+
+    const frameId = window.requestAnimationFrame(() => {
+      const activeElement = readerRef.current?.querySelector(`[data-display-index="${targetIndex}"]`) as HTMLElement | null;
+      activeElement?.scrollIntoView({ behavior: "smooth", block: "center" });
+      if (pendingScrollIndexRef.current === targetIndex) pendingScrollIndexRef.current = null;
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [visibleWindow.start, visibleWindow.end, currentIndex]);
 
   const progress = readableChunks.length
     ? Math.min(100, Math.round(((currentReadableIndex + 1) / readableChunks.length) * 100))
     : 0;
+
+  const visibleChunks = useMemo(
+    () => displayChunks.slice(visibleWindow.start, visibleWindow.end),
+    [displayChunks, visibleWindow.end, visibleWindow.start],
+  );
+  const searchResultSet = useMemo(() => new Set(searchResults), [searchResults]);
+  const hiddenBefore = visibleWindow.start;
+  const hiddenAfter = Math.max(0, displayChunks.length - visibleWindow.end);
+  const isWindowedMode = displayChunks.length > LARGE_FILE_WINDOW_THRESHOLD;
+  const visibleRangeText = displayChunks.length
+    ? `แสดงช่วง ${(visibleWindow.start + 1).toLocaleString()}-${visibleWindow.end.toLocaleString()} จาก ${displayChunks.length.toLocaleString()}`
+    : "ยังไม่มีช่วงแสดงผล";
+  const readingRangeText = readableChunks.length
+    ? `อ่านช่วง ${(currentReadableIndex + 1).toLocaleString()}/${readableChunks.length.toLocaleString()}`
+    : "ยังไม่มีช่วงอ่าน";
 
   const currentVoiceName = useMemo(() => {
     return voices.find((voice) => voice.voiceURI === selectedVoice)?.name ?? "ยังไม่พบเสียงอ่าน";
@@ -384,33 +439,36 @@ export default function AudioReader() {
     (readableIndex: number) => {
       const chunk = readableChunks[readableIndex];
       if (!chunk) return;
+      centerVisibleWindow(chunk.displayIndex);
       setCurrentReadableIndex(readableIndex);
       setCurrentIndex(chunk.displayIndex);
     },
-    [readableChunks],
+    [centerVisibleWindow, readableChunks],
   );
 
   const jumpToDisplayChunk = useCallback(
     (displayIndex: number) => {
       const chunk = displayChunks[displayIndex];
       if (!chunk) return;
-      const nextReadableIndex =
+      centerVisibleWindow(displayIndex);
+      setCurrentIndex(displayIndex);
+
+      const nextReadableDisplayIndex =
         chunk.readableIndex ??
         readableChunks.find((readableChunk) => readableChunk.displayIndex > displayIndex)?.displayIndex ??
         -1;
 
-      setCurrentIndex(displayIndex);
       if (chunk.readableIndex !== null) {
         setCurrentReadableIndex(chunk.readableIndex);
         return;
       }
 
       const fallbackReadableIndex = readableChunks.findIndex(
-        (readableChunk) => readableChunk.displayIndex === nextReadableIndex,
+        (readableChunk) => readableChunk.displayIndex === nextReadableDisplayIndex,
       );
       if (fallbackReadableIndex >= 0) setCurrentReadableIndex(fallbackReadableIndex);
     },
-    [displayChunks, readableChunks],
+    [centerVisibleWindow, displayChunks, readableChunks],
   );
 
   const processText = useCallback((rawText: string, sourceName = "ข้อความที่วาง") => {
@@ -438,6 +496,8 @@ export default function AudioReader() {
     setToc(processed.toc);
     setCurrentIndex(0);
     setCurrentReadableIndex(0);
+    setVisibleWindow(clampVisibleWindow(0, processed.displayChunks.length, VISIBLE_BEFORE, VISIBLE_AFTER));
+    pendingScrollIndexRef.current = 0;
     setIsPlaying(false);
     setIsPaused(false);
     setSearchResults([]);
@@ -446,6 +506,7 @@ export default function AudioReader() {
       processed.stats.removedRuleLines ? `ลบเส้นคั่น ${processed.stats.removedRuleLines} จุด` : "",
       processed.stats.splitLongParagraphs ? `ตัดย่อหน้ายาว ${processed.stats.splitLongParagraphs} จุด` : "",
       processed.stats.collapsedBlankRuns ? `ลดช่องว่าง ${processed.stats.collapsedBlankRuns} จุด` : "",
+      processed.displayChunks.length > LARGE_FILE_WINDOW_THRESHOLD ? "เปิดโหมดประหยัดการแสดงผล" : "",
     ].filter(Boolean);
     setPendingResume(
       previousSession && safeResumeIndex > 0
@@ -488,6 +549,7 @@ export default function AudioReader() {
         window.clearTimeout(watchdogTimerRef.current);
         watchdogTimerRef.current = null;
       }
+      centerVisibleWindow(chunk.displayIndex);
       setCurrentReadableIndex(readableIndex);
       setCurrentIndex(chunk.displayIndex);
       const utterance = new SpeechSynthesisUtterance(chunk.text);
@@ -537,7 +599,7 @@ export default function AudioReader() {
       scheduleSpeechWatchdog(readableIndex, chunk.text);
       window.speechSynthesis.speak(utterance);
     },
-    [clearSpeechTimers, ensureSpeechKeepAlive, rate, readableChunks, scheduleSpeechWatchdog, selectedVoice, voices],
+    [centerVisibleWindow, clearSpeechTimers, ensureSpeechKeepAlive, rate, readableChunks, scheduleSpeechWatchdog, selectedVoice, voices],
   );
 
   useEffect(() => {
@@ -645,6 +707,33 @@ export default function AudioReader() {
     jumpToReadableChunk(0);
     setPendingResume(null);
     setNotice("เริ่มอ่านจากต้นไฟล์");
+  };
+
+  const focusCurrentPosition = () => centerVisibleWindow(currentIndex);
+
+  const expandVisibleWindow = () => {
+    setVisibleWindow((previous) =>
+      clampVisibleWindow(
+        currentIndex,
+        displayChunks.length,
+        previous.before + VISIBLE_EXPAND_STEP,
+        previous.after + VISIBLE_EXPAND_STEP,
+      ),
+    );
+  };
+
+  const revealPreviousWindow = () => {
+    setVisibleWindow((previous) => ({
+      ...previous,
+      start: Math.max(0, previous.start - VISIBLE_EXPAND_STEP),
+    }));
+  };
+
+  const revealNextWindow = () => {
+    setVisibleWindow((previous) => ({
+      ...previous,
+      end: Math.min(displayChunks.length, previous.end + VISIBLE_EXPAND_STEP),
+    }));
   };
 
   return (
@@ -821,9 +910,28 @@ export default function AudioReader() {
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#d7ad65]/15 px-4 py-3 text-xs text-[#a99a82]">
                 <div className="min-w-0 flex-1">
                   <span className="block truncate">{fileName ? `${fileName} · ` : ""}{notice}</span>
+                  <span className="mt-1 block text-[#d7ad65]">
+                    {visibleRangeText} · {readingRangeText}
+                    {isWindowedMode ? " · โหมดไฟล์ใหญ่" : ""}
+                  </span>
                 </div>
-                {pendingResume && (
-                  <div className="flex flex-wrap gap-2">
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={focusCurrentPosition}
+                    className="rounded border border-[#d7ad65]/40 px-3 py-1.5 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
+                  >
+                    ไปยังตำแหน่งที่อ่าน
+                  </button>
+                  {isWindowedMode && (
+                    <button
+                      onClick={expandVisibleWindow}
+                      className="rounded border border-[#5d86a3]/45 px-3 py-1.5 text-xs font-bold text-[#cfe8f7] hover:bg-[#5d86a3]/10"
+                    >
+                      ขยายช่วงแสดงผล
+                    </button>
+                  )}
+                  {pendingResume && (
+                    <>
                     <button
                       onClick={resumeFromSavedPosition}
                       className="rounded border border-[#d7ad65]/40 px-3 py-1.5 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
@@ -836,17 +944,28 @@ export default function AudioReader() {
                     >
                       เริ่มใหม่
                     </button>
-                  </div>
-                )}
+                    </>
+                  )}
+                </div>
                 <span className="truncate text-right">{currentVoiceName}</span>
               </div>
 
               <div ref={readerRef} className="bdo-scrollbar flex-1 overflow-y-auto p-5 text-lg leading-9 md:p-8 md:text-xl md:leading-10">
-                {displayChunks.map((chunk, index) => {
-                  const isMatch = searchResults.includes(index);
+                {hiddenBefore > 0 && (
+                  <button
+                    onClick={revealPreviousWindow}
+                    className="mb-4 block w-full rounded border border-[#d7ad65]/25 bg-black/25 px-3 py-2 text-center text-sm text-[#d7ad65] hover:bg-[#d7ad65]/10"
+                  >
+                    ก่อนหน้านี้ {hiddenBefore.toLocaleString()} ช่วง
+                  </button>
+                )}
+                {visibleChunks.map((chunk, offset) => {
+                  const index = visibleWindow.start + offset;
+                  const isMatch = searchResultSet.has(index);
                   return (
                     <button
                       key={`${chunk.start}-${index}`}
+                      data-display-index={index}
                       onClick={() => jumpToChunk(index)}
                       className={`block w-full whitespace-pre-wrap rounded px-3 py-2 text-left transition ${
                         index === currentIndex
@@ -860,6 +979,14 @@ export default function AudioReader() {
                     </button>
                   );
                 })}
+                {hiddenAfter > 0 && (
+                  <button
+                    onClick={revealNextWindow}
+                    className="mt-4 block w-full rounded border border-[#d7ad65]/25 bg-black/25 px-3 py-2 text-center text-sm text-[#d7ad65] hover:bg-[#d7ad65]/10"
+                  >
+                    หลังจากนี้ {hiddenAfter.toLocaleString()} ช่วง
+                  </button>
+                )}
               </div>
             </section>
           </div>
