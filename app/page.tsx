@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const MAX_FILE_SIZE = 4 * 1024 * 1024;
 const CHUNK_DELAY_MS = 20;
+const READER_CHUNK_MAX = 540;
 const SAMPLE_TEXT = `บทที่ 1 เสียงจากทะเลทราย
 
 ลมร้อนพัดผ่านซากหินสีดำ ขณะที่นักผจญภัยหยุดยืนหน้าประตูโบราณ แสงสีทองค่อย ๆ ไหลไปตามรอยสลักราวกับมันกำลังตื่นจากการหลับใหลยาวนาน
@@ -16,6 +17,12 @@ interface Chunk {
   text: string;
   start: number;
   end: number;
+  readableIndex: number | null;
+}
+
+interface ReadableChunk {
+  text: string;
+  displayIndex: number;
 }
 
 interface TocItem {
@@ -23,17 +30,135 @@ interface TocItem {
   chunkIndex: number;
 }
 
-const hasReadableText = (chunk?: Chunk) => Boolean(chunk?.text.trim());
+interface CleanStats {
+  removedRuleLines: number;
+  splitLongParagraphs: number;
+  collapsedBlankRuns: number;
+}
+
+interface ProcessedText {
+  text: string;
+  displayChunks: Chunk[];
+  readableChunks: ReadableChunk[];
+  toc: TocItem[];
+  stats: CleanStats;
+}
+
+const blankStats = (): CleanStats => ({
+  removedRuleLines: 0,
+  splitLongParagraphs: 0,
+  collapsedBlankRuns: 0,
+});
+
+const normalizeTextLine = (value: string) =>
+  value
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+
+const isChapterTitle = (value: string) => /^\s*(บทพิเศษ|บทที่|ตอนที่|chapter)\s*[\wก-๙ .:-]+/i.test(value);
+
+const splitLongParagraph = (paragraph: string, stats: CleanStats) => {
+  const clean = normalizeTextLine(paragraph);
+  if (clean.length <= READER_CHUNK_MAX) return [clean];
+
+  stats.splitLongParagraphs += 1;
+  const chunks: string[] = [];
+  let remaining = clean;
+  const breakChars = ["”", "?", "!", "ฯ", "。", ".", ",", "，", " "];
+
+  while (remaining.length > READER_CHUNK_MAX) {
+    let cut = -1;
+    for (const character of breakChars) {
+      const index = remaining.lastIndexOf(character, READER_CHUNK_MAX);
+      if (index > Math.floor(READER_CHUNK_MAX * 0.55)) {
+        cut = index + (character === " " ? 0 : 1);
+        break;
+      }
+    }
+    if (cut <= 0) cut = READER_CHUNK_MAX;
+
+    chunks.push(remaining.slice(0, cut).trim());
+    remaining = remaining.slice(cut).trim();
+  }
+
+  if (remaining) chunks.push(remaining);
+  return chunks.filter(Boolean);
+};
+
+const normalizeUploadedText = (rawText: string, stats: CleanStats) => {
+  const normalized = rawText
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\u00a0/g, " ");
+
+  const lines = normalized.split("\n");
+  const keptLines = lines.filter((line) => {
+    const trimmed = line.trim();
+    const isRuleLine = /^═{8,}$/.test(trimmed) || /^[-–—_]{8,}$/.test(trimmed);
+    if (isRuleLine) stats.removedRuleLines += 1;
+    return !isRuleLine;
+  });
+
+  const withoutTrailingSpaces = keptLines.join("\n").replace(/[ \t]+\n/g, "\n");
+  const collapsed = withoutTrailingSpaces.replace(/\n{3,}/g, () => {
+    stats.collapsedBlankRuns += 1;
+    return "\n\n";
+  });
+
+  return collapsed.trim();
+};
+
+const buildProcessedText = (rawText: string): ProcessedText => {
+  const stats = blankStats();
+  const text = normalizeUploadedText(rawText, stats);
+  const displayChunks: Chunk[] = [];
+  const readableChunks: ReadableChunk[] = [];
+  const toc: TocItem[] = [];
+
+  const pushReadableChunk = (chunkText: string) => {
+    const displayIndex = displayChunks.length;
+    const readableIndex = readableChunks.length;
+    displayChunks.push({
+      text: chunkText,
+      start: displayIndex,
+      end: displayIndex + chunkText.length,
+      readableIndex,
+    });
+    readableChunks.push({ text: chunkText, displayIndex });
+
+    if (isChapterTitle(chunkText)) {
+      toc.push({ title: chunkText.slice(0, 80), chunkIndex: displayIndex });
+    }
+  };
+
+  text
+    .split(/\n{2,}/)
+    .map(normalizeTextLine)
+    .filter(Boolean)
+    .forEach((paragraph, paragraphIndex) => {
+      if (paragraphIndex > 0) {
+        const displayIndex = displayChunks.length;
+        displayChunks.push({ text: "\n", start: displayIndex, end: displayIndex + 1, readableIndex: null });
+      }
+
+      splitLongParagraph(paragraph, stats).forEach(pushReadableChunk);
+    });
+
+  return { text, displayChunks, readableChunks, toc, stats };
+};
 
 export default function AudioReader() {
   const [text, setText] = useState("");
   const [displayChunks, setDisplayChunks] = useState<Chunk[]>([]);
+  const [readableChunks, setReadableChunks] = useState<ReadableChunk[]>([]);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoice, setSelectedVoice] = useState("");
   const [rate, setRate] = useState(1);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentReadableIndex, setCurrentReadableIndex] = useState(0);
   const [toc, setToc] = useState<TocItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<number[]>([]);
@@ -41,7 +166,7 @@ export default function AudioReader() {
   const [notice, setNotice] = useState("พร้อมรับไฟล์ .txt หรือวางข้อความเพื่อเริ่มอ่าน");
 
   const readerRef = useRef<HTMLDivElement>(null);
-  const speakChunkRef = useRef<(index: number) => void>(() => {});
+  const speakChunkRef = useRef<(readableIndex: number) => void>(() => {});
 
   useEffect(() => {
     const loadVoices = () => {
@@ -96,59 +221,75 @@ export default function AudioReader() {
     activeElement?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [currentIndex]);
 
-  const progress = displayChunks.length
-    ? Math.min(100, Math.round(((currentIndex + 1) / displayChunks.length) * 100))
+  const progress = readableChunks.length
+    ? Math.min(100, Math.round(((currentReadableIndex + 1) / readableChunks.length) * 100))
     : 0;
 
   const currentVoiceName = useMemo(() => {
     return voices.find((voice) => voice.voiceURI === selectedVoice)?.name ?? "ยังไม่พบเสียงอ่าน";
   }, [selectedVoice, voices]);
 
-  const findReadableChunk = useCallback(
-    (startIndex: number, direction: 1 | -1 = 1) => {
-      let index = Math.max(0, Math.min(displayChunks.length - 1, startIndex));
-      while (displayChunks[index] && !hasReadableText(displayChunks[index])) {
-        index += direction;
-      }
-      return displayChunks[index] ? index : -1;
+  const jumpToReadableChunk = useCallback(
+    (readableIndex: number) => {
+      const chunk = readableChunks[readableIndex];
+      if (!chunk) return;
+      setCurrentReadableIndex(readableIndex);
+      setCurrentIndex(chunk.displayIndex);
     },
-    [displayChunks],
+    [readableChunks],
+  );
+
+  const jumpToDisplayChunk = useCallback(
+    (displayIndex: number) => {
+      const chunk = displayChunks[displayIndex];
+      if (!chunk) return;
+      const nextReadableIndex =
+        chunk.readableIndex ??
+        readableChunks.find((readableChunk) => readableChunk.displayIndex > displayIndex)?.displayIndex ??
+        -1;
+
+      setCurrentIndex(displayIndex);
+      if (chunk.readableIndex !== null) {
+        setCurrentReadableIndex(chunk.readableIndex);
+        return;
+      }
+
+      const fallbackReadableIndex = readableChunks.findIndex(
+        (readableChunk) => readableChunk.displayIndex === nextReadableIndex,
+      );
+      if (fallbackReadableIndex >= 0) setCurrentReadableIndex(fallbackReadableIndex);
+    },
+    [displayChunks, readableChunks],
   );
 
   const processText = useCallback((rawText: string) => {
-    const cleanedText = rawText.replace(/\r\n/g, "\n").trim();
-    if (!cleanedText) {
+    const processed = buildProcessedText(rawText);
+    if (!processed.text || processed.readableChunks.length === 0) {
       setNotice("ยังไม่มีข้อความให้อ่าน");
       return;
     }
 
-    const finalChunks = cleanedText
-      .split(/(\n{2,}|[^\n]+(?:\n)?)/g)
-      .filter(Boolean)
-      .map((line, index) => ({
-        text: line,
-        start: index,
-        end: index + line.length,
-      }));
-
-    const generatedToc: TocItem[] = [];
-    finalChunks.forEach((chunk, index) => {
-      const match = chunk.text.match(/^\s*(ตอนที่|บทที่|chapter)\s*[\wก-๙ .:-]+/i);
-      if (match) {
-        generatedToc.push({ title: chunk.text.trim().slice(0, 80), chunkIndex: index });
-      }
-    });
-
     window.speechSynthesis.cancel();
-    setText(cleanedText);
-    setDisplayChunks(finalChunks);
-    setToc(generatedToc);
+    setText(processed.text);
+    setDisplayChunks(processed.displayChunks);
+    setReadableChunks(processed.readableChunks);
+    setToc(processed.toc);
     setCurrentIndex(0);
+    setCurrentReadableIndex(0);
     setIsPlaying(false);
     setIsPaused(false);
     setSearchResults([]);
     setCurrentSearchIndex(-1);
-    setNotice(`โหลดข้อความแล้ว ${cleanedText.length.toLocaleString()} ตัวอักษร`);
+    const cleanSummary = [
+      processed.stats.removedRuleLines ? `ลบเส้นคั่น ${processed.stats.removedRuleLines} จุด` : "",
+      processed.stats.splitLongParagraphs ? `ตัดย่อหน้ายาว ${processed.stats.splitLongParagraphs} จุด` : "",
+      processed.stats.collapsedBlankRuns ? `ลดช่องว่าง ${processed.stats.collapsedBlankRuns} จุด` : "",
+    ].filter(Boolean);
+    setNotice(
+      `โหลดแล้ว ${processed.text.length.toLocaleString()} ตัวอักษร · อ่านได้ ${processed.readableChunks.length.toLocaleString()} ช่วง${
+        cleanSummary.length ? ` · ${cleanSummary.join(" · ")}` : ""
+      }`,
+    );
   }, []);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -167,17 +308,18 @@ export default function AudioReader() {
   };
 
   const speakChunk = useCallback(
-    (index: number) => {
-      const readableIndex = findReadableChunk(index);
-      if (readableIndex < 0 || readableIndex >= displayChunks.length) {
+    (readableIndex: number) => {
+      const chunk = readableChunks[readableIndex];
+      if (!chunk) {
         setIsPlaying(false);
         setIsPaused(false);
         return;
       }
 
       window.speechSynthesis.cancel();
-      setCurrentIndex(readableIndex);
-      const utterance = new SpeechSynthesisUtterance(displayChunks[readableIndex].text.trim());
+      setCurrentReadableIndex(readableIndex);
+      setCurrentIndex(chunk.displayIndex);
+      const utterance = new SpeechSynthesisUtterance(chunk.text);
       const voice = voices.find((voiceItem) => voiceItem.voiceURI === selectedVoice);
       if (voice) {
         utterance.voice = voice;
@@ -185,9 +327,9 @@ export default function AudioReader() {
       }
       utterance.rate = rate;
       utterance.onend = () => {
-        const next = findReadableChunk(readableIndex + 1);
-        if (next >= 0) {
-          window.setTimeout(() => speakChunkRef.current(next), CHUNK_DELAY_MS);
+        const nextReadableIndex = readableIndex + 1;
+        if (readableChunks[nextReadableIndex]) {
+          window.setTimeout(() => speakChunkRef.current(nextReadableIndex), CHUNK_DELAY_MS);
           return;
         }
         setIsPlaying(false);
@@ -196,7 +338,7 @@ export default function AudioReader() {
 
       window.speechSynthesis.speak(utterance);
     },
-    [displayChunks, findReadableChunk, rate, selectedVoice, voices],
+    [rate, readableChunks, selectedVoice, voices],
   );
 
   useEffect(() => {
@@ -204,12 +346,16 @@ export default function AudioReader() {
   }, [speakChunk]);
 
   const jumpToChunk = useCallback(
-    (index: number) => {
-      if (!displayChunks[index]) return;
-      setCurrentIndex(index);
-      if (isPlaying && !isPaused) speakChunk(index);
+    (displayIndex: number) => {
+      const chunk = displayChunks[displayIndex];
+      if (!chunk) return;
+      jumpToDisplayChunk(displayIndex);
+      if (isPlaying && !isPaused) {
+        const readableIndex = chunk.readableIndex ?? currentReadableIndex;
+        speakChunk(readableIndex);
+      }
     },
-    [displayChunks, isPaused, isPlaying, speakChunk],
+    [currentReadableIndex, displayChunks, isPaused, isPlaying, jumpToDisplayChunk, speakChunk],
   );
 
   const handleSearch = () => {
@@ -242,7 +388,7 @@ export default function AudioReader() {
   };
 
   const togglePlay = () => {
-    if (!displayChunks.length) {
+    if (!readableChunks.length) {
       setNotice("เพิ่มข้อความก่อนเริ่มอ่าน");
       return;
     }
@@ -261,7 +407,7 @@ export default function AudioReader() {
 
     setIsPlaying(true);
     setIsPaused(false);
-    speakChunk(currentIndex);
+    speakChunk(currentReadableIndex);
   };
 
   const stopReading = () => {
@@ -271,8 +417,9 @@ export default function AudioReader() {
   };
 
   const moveChunk = (offset: number) => {
-    const target = findReadableChunk(currentIndex + offset, offset >= 0 ? 1 : -1);
-    if (target >= 0) jumpToChunk(target);
+    const target = Math.max(0, Math.min(readableChunks.length - 1, currentReadableIndex + offset));
+    jumpToReadableChunk(target);
+    if (isPlaying && !isPaused) speakChunk(target);
   };
 
   return (
@@ -292,8 +439,8 @@ export default function AudioReader() {
 
           <div className="grid grid-cols-3 gap-2 rounded border border-[#d7ad65]/25 bg-black/35 p-2 text-center shadow-2xl shadow-black/30 backdrop-blur">
             <div className="px-3 py-2">
-              <p className="text-lg font-bold text-[#ffe2a3]">{displayChunks.length}</p>
-              <p className="text-[11px] text-[#a99a82]">ช่วงข้อความ</p>
+              <p className="text-lg font-bold text-[#ffe2a3]">{readableChunks.length}</p>
+              <p className="text-[11px] text-[#a99a82]">ช่วงอ่าน</p>
             </div>
             <div className="border-x border-[#d7ad65]/20 px-3 py-2">
               <p className="text-lg font-bold text-[#ffe2a3]">{toc.length}</p>
