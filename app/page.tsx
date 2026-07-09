@@ -9,6 +9,8 @@ const SPEECH_WATCHDOG_EXTRA_MS = 7000;
 const SPEECH_WATCHDOG_MIN_MS = 12000;
 const SPEECH_WATCHDOG_MAX_MS = 45000;
 const SPEECH_KEEP_ALIVE_MS = 9000;
+const RESUME_STORAGE_KEY = "audioReaderResumeSessions";
+const RESUME_STORAGE_LIMIT = 12;
 const SAMPLE_TEXT = `บทที่ 1 เสียงจากทะเลทราย
 
 ลมร้อนพัดผ่านซากหินสีดำ ขณะที่นักผจญภัยหยุดยืนหน้าประตูโบราณ แสงสีทองค่อย ๆ ไหลไปตามรอยสลักราวกับมันกำลังตื่นจากการหลับใหลยาวนาน
@@ -46,6 +48,24 @@ interface ProcessedText {
   readableChunks: ReadableChunk[];
   toc: TocItem[];
   stats: CleanStats;
+}
+
+interface ResumeSession {
+  fileHash: string;
+  fileName: string;
+  textLength: number;
+  readableCount: number;
+  currentReadableIndex: number;
+  currentDisplayIndex: number;
+  rate: number;
+  voiceURI: string;
+  updatedAt: string;
+}
+
+interface PendingResume {
+  session: ResumeSession;
+  displayIndex: number;
+  readableIndex: number;
 }
 
 const blankStats = (): CleanStats => ({
@@ -113,6 +133,39 @@ const normalizeUploadedText = (rawText: string, stats: CleanStats) => {
   return collapsed.trim();
 };
 
+const hashText = (value: string) => {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+};
+
+const readResumeSessions = (): ResumeSession[] => {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(RESUME_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeResumeSessions = (sessions: ResumeSession[]) => {
+  localStorage.setItem(RESUME_STORAGE_KEY, JSON.stringify(sessions.slice(0, RESUME_STORAGE_LIMIT)));
+};
+
+const findResumeSession = (fileHash: string) =>
+  readResumeSessions().find((session) => session.fileHash === fileHash) ?? null;
+
+const saveResumeSession = (session: ResumeSession) => {
+  const otherSessions = readResumeSessions().filter((item) => item.fileHash !== session.fileHash);
+  writeResumeSessions([session, ...otherSessions]);
+};
+
 const buildProcessedText = (rawText: string): ProcessedText => {
   const stats = blankStats();
   const text = normalizeUploadedText(rawText, stats);
@@ -168,6 +221,9 @@ export default function AudioReader() {
   const [searchResults, setSearchResults] = useState<number[]>([]);
   const [currentSearchIndex, setCurrentSearchIndex] = useState(-1);
   const [notice, setNotice] = useState("พร้อมรับไฟล์ .txt หรือวางข้อความเพื่อเริ่มอ่าน");
+  const [fileName, setFileName] = useState("");
+  const [fileHash, setFileHash] = useState("");
+  const [pendingResume, setPendingResume] = useState<PendingResume | null>(null);
 
   const readerRef = useRef<HTMLDivElement>(null);
   const speakChunkRef = useRef<(readableIndex: number) => void>(() => {});
@@ -237,6 +293,21 @@ export default function AudioReader() {
   useEffect(() => {
     currentReadableIndexRef.current = currentReadableIndex;
   }, [currentReadableIndex]);
+
+  useEffect(() => {
+    if (!fileHash || !readableChunks.length) return;
+    saveResumeSession({
+      fileHash,
+      fileName: fileName || "ข้อความที่วาง",
+      textLength: text.length,
+      readableCount: readableChunks.length,
+      currentReadableIndex,
+      currentDisplayIndex: currentIndex,
+      rate,
+      voiceURI: selectedVoice,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [currentIndex, currentReadableIndex, fileHash, fileName, rate, readableChunks.length, selectedVoice, text.length]);
 
   useEffect(() => {
     const activeElement = readerRef.current?.querySelector(".active-chunk") as HTMLElement | null;
@@ -342,17 +413,26 @@ export default function AudioReader() {
     [displayChunks, readableChunks],
   );
 
-  const processText = useCallback((rawText: string) => {
+  const processText = useCallback((rawText: string, sourceName = "ข้อความที่วาง") => {
     const processed = buildProcessedText(rawText);
     if (!processed.text || processed.readableChunks.length === 0) {
       setNotice("ยังไม่มีข้อความให้อ่าน");
       return;
     }
 
+    const nextFileHash = hashText(`${sourceName}:${processed.text.length}:${processed.text.slice(0, 5000)}`);
+    const previousSession = findResumeSession(nextFileHash);
+    const safeResumeIndex = previousSession
+      ? Math.min(previousSession.currentReadableIndex, processed.readableChunks.length - 1)
+      : -1;
+    const safeDisplayIndex = safeResumeIndex >= 0 ? processed.readableChunks[safeResumeIndex].displayIndex : 0;
+
     window.speechSynthesis.cancel();
     clearSpeechTimers();
     activeUtteranceRef.current = null;
     setText(processed.text);
+    setFileName(sourceName);
+    setFileHash(nextFileHash);
     setDisplayChunks(processed.displayChunks);
     setReadableChunks(processed.readableChunks);
     setToc(processed.toc);
@@ -367,10 +447,15 @@ export default function AudioReader() {
       processed.stats.splitLongParagraphs ? `ตัดย่อหน้ายาว ${processed.stats.splitLongParagraphs} จุด` : "",
       processed.stats.collapsedBlankRuns ? `ลดช่องว่าง ${processed.stats.collapsedBlankRuns} จุด` : "",
     ].filter(Boolean);
+    setPendingResume(
+      previousSession && safeResumeIndex > 0
+        ? { session: previousSession, displayIndex: safeDisplayIndex, readableIndex: safeResumeIndex }
+        : null,
+    );
     setNotice(
       `โหลดแล้ว ${processed.text.length.toLocaleString()} ตัวอักษร · อ่านได้ ${processed.readableChunks.length.toLocaleString()} ช่วง${
         cleanSummary.length ? ` · ${cleanSummary.join(" · ")}` : ""
-      }`,
+      }${previousSession && safeResumeIndex > 0 ? " · พบตำแหน่งอ่านล่าสุด" : ""}`,
     );
   }, [clearSpeechTimers]);
 
@@ -384,7 +469,7 @@ export default function AudioReader() {
     }
 
     const reader = new FileReader();
-    reader.onload = (readerEvent) => processText((readerEvent.target?.result as string) ?? "");
+    reader.onload = (readerEvent) => processText((readerEvent.target?.result as string) ?? "", file.name);
     reader.onerror = () => setNotice("อ่านไฟล์ไม่สำเร็จ ลองเลือกไฟล์อีกครั้ง");
     reader.readAsText(file);
   };
@@ -543,6 +628,23 @@ export default function AudioReader() {
     const target = Math.max(0, Math.min(readableChunks.length - 1, currentReadableIndex + offset));
     jumpToReadableChunk(target);
     if (isPlaying && !isPaused) speakChunk(target);
+  };
+
+  const resumeFromSavedPosition = () => {
+    if (!pendingResume) return;
+    const { session, readableIndex } = pendingResume;
+    setRate(session.rate);
+    if (session.voiceURI) setSelectedVoice(session.voiceURI);
+    jumpToReadableChunk(readableIndex);
+    setPendingResume(null);
+    setNotice(`อ่านต่อจากครั้งล่าสุดที่ช่วง ${readableIndex + 1}/${readableChunks.length}`);
+  };
+
+  const startFromBeginning = () => {
+    stopReading();
+    jumpToReadableChunk(0);
+    setPendingResume(null);
+    setNotice("เริ่มอ่านจากต้นไฟล์");
   };
 
   return (
@@ -716,8 +818,26 @@ export default function AudioReader() {
                 <div className="h-full bg-gradient-to-r from-[#7a562d] via-[#d7ad65] to-[#fff0bd]" style={{ width: `${progress}%` }} />
               </div>
 
-              <div className="flex items-center justify-between gap-3 border-b border-[#d7ad65]/15 px-4 py-3 text-xs text-[#a99a82]">
-                <span>{notice}</span>
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#d7ad65]/15 px-4 py-3 text-xs text-[#a99a82]">
+                <div className="min-w-0 flex-1">
+                  <span className="block truncate">{fileName ? `${fileName} · ` : ""}{notice}</span>
+                </div>
+                {pendingResume && (
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={resumeFromSavedPosition}
+                      className="rounded border border-[#d7ad65]/40 px-3 py-1.5 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
+                    >
+                      อ่านต่อ
+                    </button>
+                    <button
+                      onClick={startFromBeginning}
+                      className="rounded border border-[#5d86a3]/45 px-3 py-1.5 text-xs font-bold text-[#cfe8f7] hover:bg-[#5d86a3]/10"
+                    >
+                      เริ่มใหม่
+                    </button>
+                  </div>
+                )}
                 <span className="truncate text-right">{currentVoiceName}</span>
               </div>
 
