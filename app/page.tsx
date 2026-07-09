@@ -1,5 +1,6 @@
 "use client";
 
+import { createClient, type User } from "@supabase/supabase-js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const MAX_FILE_SIZE = 4 * 1024 * 1024;
@@ -15,6 +16,13 @@ const VISIBLE_BEFORE = 80;
 const VISIBLE_AFTER = 180;
 const VISIBLE_EXPAND_STEP = 120;
 const LARGE_FILE_WINDOW_THRESHOLD = 2000;
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
+const SUPABASE_CONFIGURED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+const ALLOWED_EMAILS = (process.env.NEXT_PUBLIC_ALLOWED_EMAILS ?? process.env.NEXT_PUBLIC_ALLOWED_EMAIL ?? "")
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean);
 const SAMPLE_TEXT = `บทที่ 1 เสียงจากทะเลทราย
 
 ลมร้อนพัดผ่านซากหินสีดำ ขณะที่นักผจญภัยหยุดยืนหน้าประตูโบราณ แสงสีทองค่อย ๆ ไหลไปตามรอยสลักราวกับมันกำลังตื่นจากการหลับใหลยาวนาน
@@ -229,6 +237,17 @@ const buildProcessedText = (rawText: string): ProcessedText => {
 };
 
 export default function AudioReader() {
+  const supabase = useMemo(() => {
+    if (!SUPABASE_CONFIGURED) return null;
+    return createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  }, []);
+  const authConfigured = Boolean(supabase);
+  const [authLoading, setAuthLoading] = useState(SUPABASE_CONFIGURED);
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const [text, setText] = useState("");
   const [displayChunks, setDisplayChunks] = useState<Chunk[]>([]);
   const [readableChunks, setReadableChunks] = useState<ReadableChunk[]>([]);
@@ -260,6 +279,31 @@ export default function AudioReader() {
   const isPausedRef = useRef(false);
   const currentReadableIndexRef = useRef(0);
   const pendingScrollIndexRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!supabase) {
+      return;
+    }
+
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (!active) return;
+      setAuthUser(data.session?.user ?? null);
+      setAuthLoading(false);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setAuthUser(session?.user ?? null);
+      setAuthLoading(false);
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, [supabase]);
 
   useEffect(() => {
     const loadVoices = () => {
@@ -709,6 +753,39 @@ export default function AudioReader() {
     setNotice("เริ่มอ่านจากต้นไฟล์");
   };
 
+  const signedInEmail = authUser?.email?.toLowerCase() ?? "";
+  const isAllowedUser = Boolean(authUser) && (ALLOWED_EMAILS.length === 0 || ALLOWED_EMAILS.includes(signedInEmail));
+
+  const signInWithPassword = async () => {
+    if (!supabase || !authEmail.trim() || !authPassword) return;
+    setAuthBusy(true);
+    setAuthMessage("");
+    const { error } = await supabase.auth.signInWithPassword({
+      email: authEmail.trim(),
+      password: authPassword,
+    });
+    setAuthBusy(false);
+    setAuthMessage(error ? error.message : "เข้าสู่ระบบสำเร็จ");
+  };
+
+  const sendMagicLink = async () => {
+    if (!supabase || !authEmail.trim()) return;
+    setAuthBusy(true);
+    setAuthMessage("");
+    const { error } = await supabase.auth.signInWithOtp({
+      email: authEmail.trim(),
+      options: { emailRedirectTo: window.location.origin },
+    });
+    setAuthBusy(false);
+    setAuthMessage(error ? error.message : "ส่งลิงก์เข้าสู่ระบบไปที่อีเมลแล้ว");
+  };
+
+  const signOut = async () => {
+    stopReading();
+    await supabase?.auth.signOut();
+    setAuthMessage("ออกจากระบบแล้ว");
+  };
+
   const focusCurrentPosition = () => centerVisibleWindow(currentIndex);
 
   const expandVisibleWindow = () => {
@@ -736,6 +813,105 @@ export default function AudioReader() {
     }));
   };
 
+  if (!authConfigured) {
+    return (
+      <main className="min-h-screen bg-[#080706] px-4 py-8 text-[#f3ead7]">
+        <div className="mx-auto flex min-h-[calc(100vh-4rem)] max-w-2xl items-center">
+          <section className="w-full rounded border border-[#d7ad65]/30 bg-[#15100c]/90 p-6 shadow-2xl shadow-black/40 md:p-8">
+            <p className="text-xs font-semibold uppercase text-[#d7ad65]">Supabase setup required</p>
+            <h1 className="mt-3 text-3xl font-black text-[#fff6df]">ตั้งค่า Auth ก่อนเปิดใช้งาน</h1>
+            <p className="mt-4 text-sm leading-7 text-[#c9baa2]">
+              เว็บถูกตั้งให้ป้องกันด้วย Supabase Auth แล้ว เพิ่ม env เหล่านี้ในเครื่องหรือ server แล้ว rebuild อีกครั้ง
+            </p>
+            <pre className="mt-5 overflow-x-auto rounded border border-[#d7ad65]/20 bg-black/45 p-4 text-xs leading-6 text-[#ffe2a3]">
+{`NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+NEXT_PUBLIC_ALLOWED_EMAILS=your@email.com`}
+            </pre>
+          </section>
+        </div>
+      </main>
+    );
+  }
+
+  if (authLoading) {
+    return (
+      <main className="grid min-h-screen place-items-center bg-[#080706] px-4 text-[#f3ead7]">
+        <div className="rounded border border-[#d7ad65]/30 bg-[#15100c]/90 px-6 py-5 text-sm text-[#d7ad65] shadow-2xl shadow-black/40">
+          กำลังตรวจสอบ session...
+        </div>
+      </main>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <main className="min-h-screen bg-[#080706] px-4 py-8 text-[#f3ead7]">
+        <div className="mx-auto flex min-h-[calc(100vh-4rem)] max-w-md items-center">
+          <section className="w-full rounded border border-[#d7ad65]/30 bg-[#15100c]/90 p-6 shadow-2xl shadow-black/40 md:p-8">
+            <p className="text-xs font-semibold uppercase text-[#d7ad65]">Private Audio Reader</p>
+            <h1 className="mt-3 text-3xl font-black text-[#fff6df]">เข้าสู่ระบบ</h1>
+            <p className="mt-3 text-sm leading-6 text-[#c9baa2]">
+              พื้นที่นี้ถูกล็อกไว้สำหรับผู้ใช้ที่อนุญาตเท่านั้น
+            </p>
+            <div className="mt-6 space-y-3">
+              <input
+                type="email"
+                value={authEmail}
+                onChange={(event) => setAuthEmail(event.target.value)}
+                placeholder="email"
+                className="w-full rounded border border-[#d7ad65]/25 bg-[#090807] px-4 py-3 text-sm text-[#f3ead7] outline-none focus:border-[#d7ad65]"
+              />
+              <input
+                type="password"
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                onKeyDown={(event) => event.key === "Enter" && signInWithPassword()}
+                placeholder="password"
+                className="w-full rounded border border-[#d7ad65]/25 bg-[#090807] px-4 py-3 text-sm text-[#f3ead7] outline-none focus:border-[#d7ad65]"
+              />
+              <button
+                onClick={signInWithPassword}
+                disabled={authBusy}
+                className="w-full rounded bg-[#d7ad65] px-5 py-3 text-sm font-black text-[#17100c] transition hover:bg-[#f0c97f] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {authBusy ? "กำลังเข้าสู่ระบบ..." : "เข้าสู่ระบบ"}
+              </button>
+              <button
+                onClick={sendMagicLink}
+                disabled={authBusy}
+                className="w-full rounded border border-[#d7ad65]/40 px-5 py-3 text-sm font-bold text-[#ffe2a3] transition hover:bg-[#d7ad65]/10 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                ส่ง Magic Link
+              </button>
+            </div>
+            {authMessage && <p className="mt-4 text-sm leading-6 text-[#c9baa2]">{authMessage}</p>}
+          </section>
+        </div>
+      </main>
+    );
+  }
+
+  if (!isAllowedUser) {
+    return (
+      <main className="grid min-h-screen place-items-center bg-[#080706] px-4 text-[#f3ead7]">
+        <section className="w-full max-w-md rounded border border-[#d7ad65]/30 bg-[#15100c]/90 p-6 shadow-2xl shadow-black/40">
+          <p className="text-xs font-semibold uppercase text-[#d7ad65]">Access blocked</p>
+          <h1 className="mt-3 text-2xl font-black text-[#fff6df]">อีเมลนี้ยังไม่ได้รับอนุญาต</h1>
+          <p className="mt-3 text-sm leading-6 text-[#c9baa2]">
+            กำลัง login ด้วย {authUser.email} แต่ไม่อยู่ใน allowlist ของระบบ
+          </p>
+          <button
+            onClick={signOut}
+            className="mt-5 rounded border border-[#d7ad65]/40 px-5 py-2.5 text-sm font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
+          >
+            ออกจากระบบ
+          </button>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="min-h-screen overflow-hidden bg-[#080706] text-[#f3ead7]">
       <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_18%_12%,rgba(213,171,91,0.26),transparent_28%),radial-gradient(circle_at_82%_20%,rgba(93,134,163,0.18),transparent_32%),linear-gradient(135deg,#0a0806_0%,#17100c_42%,#070707_100%)]" />
@@ -744,7 +920,18 @@ export default function AudioReader() {
       <section className="relative mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-5 px-4 py-5 sm:px-6 lg:px-8">
         <header className="flex flex-col gap-4 border-b border-[#d7ad65]/25 pb-5 lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <p className="text-xs font-semibold uppercase text-[#d7ad65]">Black Desert Inspired Reader</p>
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-xs font-semibold uppercase text-[#d7ad65]">Black Desert Inspired Reader</p>
+              <span className="rounded border border-[#d7ad65]/25 bg-black/30 px-2.5 py-1 text-[11px] text-[#c9baa2]">
+                {authUser.email}
+              </span>
+              <button
+                onClick={signOut}
+                className="rounded border border-[#d7ad65]/30 px-2.5 py-1 text-[11px] font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
+              >
+                Logout
+              </button>
+            </div>
             <h1 className="mt-2 text-3xl font-black text-[#fff6df] sm:text-5xl">Audio Reader</h1>
             <p className="mt-3 max-w-2xl text-sm leading-6 text-[#c7b89e]">
               อัปโหลดไฟล์นิยายหรือวางข้อความ แล้วให้ระบบอ่านออกเสียงพร้อมไฮไลต์ตำแหน่งแบบเรียลไทม์
