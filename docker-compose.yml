@@ -9,8 +9,7 @@ services:
     restart: always
     environment:
       - NODE_ENV=production
-      # Example: ให้ Next.js เชื่อมต่อกับ n8n และ postgres ภายใน Network เดียวกัน
-      - DATABASE_URL=postgresql://<YOUR_USER>:<YOUR_PASS>@n8n_zort_postgres:5432/<YOUR_DB>
+      - DATABASE_URL=${DATABASE_URL}
       - N8N_WEBHOOK_URL=http://n8n_zort:5678/webhook/
     networks:
       - n8n-zort_default
