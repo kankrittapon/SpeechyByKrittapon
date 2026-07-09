@@ -5,6 +5,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 const MAX_FILE_SIZE = 4 * 1024 * 1024;
 const CHUNK_DELAY_MS = 20;
 const READER_CHUNK_MAX = 540;
+const SPEECH_WATCHDOG_EXTRA_MS = 7000;
+const SPEECH_WATCHDOG_MIN_MS = 12000;
+const SPEECH_WATCHDOG_MAX_MS = 45000;
+const SPEECH_KEEP_ALIVE_MS = 9000;
 const SAMPLE_TEXT = `บทที่ 1 เสียงจากทะเลทราย
 
 ลมร้อนพัดผ่านซากหินสีดำ ขณะที่นักผจญภัยหยุดยืนหน้าประตูโบราณ แสงสีทองค่อย ๆ ไหลไปตามรอยสลักราวกับมันกำลังตื่นจากการหลับใหลยาวนาน
@@ -167,6 +171,12 @@ export default function AudioReader() {
 
   const readerRef = useRef<HTMLDivElement>(null);
   const speakChunkRef = useRef<(readableIndex: number) => void>(() => {});
+  const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const watchdogTimerRef = useRef<number | null>(null);
+  const keepAliveTimerRef = useRef<number | null>(null);
+  const isPlayingRef = useRef(false);
+  const isPausedRef = useRef(false);
+  const currentReadableIndexRef = useRef(0);
 
   useEffect(() => {
     const loadVoices = () => {
@@ -217,6 +227,18 @@ export default function AudioReader() {
   }, [rate]);
 
   useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
+
+  useEffect(() => {
+    currentReadableIndexRef.current = currentReadableIndex;
+  }, [currentReadableIndex]);
+
+  useEffect(() => {
     const activeElement = readerRef.current?.querySelector(".active-chunk") as HTMLElement | null;
     activeElement?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [currentIndex]);
@@ -228,6 +250,64 @@ export default function AudioReader() {
   const currentVoiceName = useMemo(() => {
     return voices.find((voice) => voice.voiceURI === selectedVoice)?.name ?? "ยังไม่พบเสียงอ่าน";
   }, [selectedVoice, voices]);
+
+  const clearSpeechTimers = useCallback(() => {
+    if (watchdogTimerRef.current !== null) {
+      window.clearTimeout(watchdogTimerRef.current);
+      watchdogTimerRef.current = null;
+    }
+    if (keepAliveTimerRef.current !== null) {
+      window.clearInterval(keepAliveTimerRef.current);
+      keepAliveTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleSpeechWatchdog = useCallback(
+    (readableIndex: number, text: string) => {
+      if (watchdogTimerRef.current !== null) {
+        window.clearTimeout(watchdogTimerRef.current);
+      }
+
+      const estimatedMs = Math.min(
+        SPEECH_WATCHDOG_MAX_MS,
+        Math.max(SPEECH_WATCHDOG_MIN_MS, (text.length / Math.max(rate, 0.5)) * 95 + SPEECH_WATCHDOG_EXTRA_MS),
+      );
+
+      watchdogTimerRef.current = window.setTimeout(() => {
+        if (!isPlayingRef.current || isPausedRef.current) return;
+        if (currentReadableIndexRef.current !== readableIndex) return;
+
+        const nextReadableIndex = readableIndex + 1;
+        if (readableChunks[nextReadableIndex]) {
+          window.speechSynthesis.cancel();
+          speakChunkRef.current(nextReadableIndex);
+          return;
+        }
+
+        setIsPlaying(false);
+        setIsPaused(false);
+      }, estimatedMs);
+    },
+    [rate, readableChunks],
+  );
+
+  const ensureSpeechKeepAlive = useCallback(() => {
+    if (keepAliveTimerRef.current !== null) return;
+    keepAliveTimerRef.current = window.setInterval(() => {
+      if (!isPlayingRef.current || isPausedRef.current) return;
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
+    }, SPEECH_KEEP_ALIVE_MS);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearSpeechTimers();
+      activeUtteranceRef.current = null;
+      window.speechSynthesis.cancel();
+    };
+  }, [clearSpeechTimers]);
 
   const jumpToReadableChunk = useCallback(
     (readableIndex: number) => {
@@ -270,6 +350,8 @@ export default function AudioReader() {
     }
 
     window.speechSynthesis.cancel();
+    clearSpeechTimers();
+    activeUtteranceRef.current = null;
     setText(processed.text);
     setDisplayChunks(processed.displayChunks);
     setReadableChunks(processed.readableChunks);
@@ -290,7 +372,7 @@ export default function AudioReader() {
         cleanSummary.length ? ` · ${cleanSummary.join(" · ")}` : ""
       }`,
     );
-  }, []);
+  }, [clearSpeechTimers]);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -317,9 +399,14 @@ export default function AudioReader() {
       }
 
       window.speechSynthesis.cancel();
+      if (watchdogTimerRef.current !== null) {
+        window.clearTimeout(watchdogTimerRef.current);
+        watchdogTimerRef.current = null;
+      }
       setCurrentReadableIndex(readableIndex);
       setCurrentIndex(chunk.displayIndex);
       const utterance = new SpeechSynthesisUtterance(chunk.text);
+      activeUtteranceRef.current = utterance;
       const voice = voices.find((voiceItem) => voiceItem.voiceURI === selectedVoice);
       if (voice) {
         utterance.voice = voice;
@@ -327,18 +414,45 @@ export default function AudioReader() {
       }
       utterance.rate = rate;
       utterance.onend = () => {
+        if (watchdogTimerRef.current !== null) {
+          window.clearTimeout(watchdogTimerRef.current);
+          watchdogTimerRef.current = null;
+        }
         const nextReadableIndex = readableIndex + 1;
         if (readableChunks[nextReadableIndex]) {
           window.setTimeout(() => speakChunkRef.current(nextReadableIndex), CHUNK_DELAY_MS);
           return;
         }
+        activeUtteranceRef.current = null;
+        clearSpeechTimers();
         setIsPlaying(false);
         setIsPaused(false);
       };
+      utterance.onerror = (event) => {
+        if (watchdogTimerRef.current !== null) {
+          window.clearTimeout(watchdogTimerRef.current);
+          watchdogTimerRef.current = null;
+        }
+        if (event.error === "interrupted" || event.error === "canceled") return;
 
+        const nextReadableIndex = readableIndex + 1;
+        if (isPlayingRef.current && !isPausedRef.current && readableChunks[nextReadableIndex]) {
+          window.setTimeout(() => speakChunkRef.current(nextReadableIndex), CHUNK_DELAY_MS);
+          return;
+        }
+
+        activeUtteranceRef.current = null;
+        clearSpeechTimers();
+        setIsPlaying(false);
+        setIsPaused(false);
+        setNotice(`ระบบอ่านเสียงหยุด: ${event.error}`);
+      };
+
+      ensureSpeechKeepAlive();
+      scheduleSpeechWatchdog(readableIndex, chunk.text);
       window.speechSynthesis.speak(utterance);
     },
-    [rate, readableChunks, selectedVoice, voices],
+    [clearSpeechTimers, ensureSpeechKeepAlive, rate, readableChunks, scheduleSpeechWatchdog, selectedVoice, voices],
   );
 
   useEffect(() => {
@@ -394,6 +508,10 @@ export default function AudioReader() {
     }
 
     if (isPlaying && !isPaused) {
+      if (watchdogTimerRef.current !== null) {
+        window.clearTimeout(watchdogTimerRef.current);
+        watchdogTimerRef.current = null;
+      }
       window.speechSynthesis.pause();
       setIsPaused(true);
       return;
@@ -401,6 +519,9 @@ export default function AudioReader() {
 
     if (isPlaying && isPaused) {
       window.speechSynthesis.resume();
+      const chunk = readableChunks[currentReadableIndex];
+      if (chunk) scheduleSpeechWatchdog(currentReadableIndex, chunk.text);
+      ensureSpeechKeepAlive();
       setIsPaused(false);
       return;
     }
@@ -411,6 +532,8 @@ export default function AudioReader() {
   };
 
   const stopReading = () => {
+    clearSpeechTimers();
+    activeUtteranceRef.current = null;
     window.speechSynthesis.cancel();
     setIsPlaying(false);
     setIsPaused(false);
