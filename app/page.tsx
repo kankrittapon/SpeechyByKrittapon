@@ -19,6 +19,7 @@ const LARGE_FILE_WINDOW_THRESHOLD = 2000;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
 const SUPABASE_CONFIGURED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+const SITE_URL = (process.env.NEXT_PUBLIC_SITE_URL ?? "").replace(/\/$/, "");
 const ALLOWED_EMAILS = (process.env.NEXT_PUBLIC_ALLOWED_EMAILS ?? process.env.NEXT_PUBLIC_ALLOWED_EMAIL ?? "")
   .split(",")
   .map((email) => email.trim().toLowerCase())
@@ -761,7 +762,7 @@ export default function AudioReader() {
     setAuthMessage("");
     const { error } = await supabase.auth.signInWithOtp({
       email: authEmail.trim(),
-      options: { emailRedirectTo: window.location.origin },
+      options: { emailRedirectTo: SITE_URL || window.location.origin },
     });
     setAuthBusy(false);
     setAuthMessage(error ? error.message : "ส่งลิงก์เข้าสู่ระบบไปที่อีเมลแล้ว");
@@ -813,7 +814,8 @@ export default function AudioReader() {
             <pre className="mt-5 overflow-x-auto rounded border border-[#d7ad65]/20 bg-black/45 p-4 text-xs leading-6 text-[#ffe2a3]">
 {`NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
-NEXT_PUBLIC_ALLOWED_EMAILS=your@email.com`}
+NEXT_PUBLIC_ALLOWED_EMAILS=your@email.com
+NEXT_PUBLIC_SITE_URL=https://your-domain.com`}
             </pre>
           </section>
         </div>
