@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const MAX_FILE_SIZE = 4 * 1024 * 1024;
+const CHUNK_DELAY_MS = 20;
 const SAMPLE_TEXT = `บทที่ 1 เสียงจากทะเลทราย
 
 ลมร้อนพัดผ่านซากหินสีดำ ขณะที่นักผจญภัยหยุดยืนหน้าประตูโบราณ แสงสีทองค่อย ๆ ไหลไปตามรอยสลักราวกับมันกำลังตื่นจากการหลับใหลยาวนาน
@@ -22,6 +23,8 @@ interface TocItem {
   chunkIndex: number;
 }
 
+const hasReadableText = (chunk?: Chunk) => Boolean(chunk?.text.trim());
+
 export default function AudioReader() {
   const [text, setText] = useState("");
   const [displayChunks, setDisplayChunks] = useState<Chunk[]>([]);
@@ -38,6 +41,7 @@ export default function AudioReader() {
   const [notice, setNotice] = useState("พร้อมรับไฟล์ .txt หรือวางข้อความเพื่อเริ่มอ่าน");
 
   const readerRef = useRef<HTMLDivElement>(null);
+  const speakChunkRef = useRef<(index: number) => void>(() => {});
 
   useEffect(() => {
     const loadVoices = () => {
@@ -100,6 +104,17 @@ export default function AudioReader() {
     return voices.find((voice) => voice.voiceURI === selectedVoice)?.name ?? "ยังไม่พบเสียงอ่าน";
   }, [selectedVoice, voices]);
 
+  const findReadableChunk = useCallback(
+    (startIndex: number, direction: 1 | -1 = 1) => {
+      let index = Math.max(0, Math.min(displayChunks.length - 1, startIndex));
+      while (displayChunks[index] && !hasReadableText(displayChunks[index])) {
+        index += direction;
+      }
+      return displayChunks[index] ? index : -1;
+    },
+    [displayChunks],
+  );
+
   const processText = useCallback((rawText: string) => {
     const cleanedText = rawText.replace(/\r\n/g, "\n").trim();
     if (!cleanedText) {
@@ -153,14 +168,16 @@ export default function AudioReader() {
 
   const speakChunk = useCallback(
     (index: number) => {
-      if (index >= displayChunks.length) {
+      const readableIndex = findReadableChunk(index);
+      if (readableIndex < 0 || readableIndex >= displayChunks.length) {
         setIsPlaying(false);
         setIsPaused(false);
         return;
       }
 
       window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(displayChunks[index].text);
+      setCurrentIndex(readableIndex);
+      const utterance = new SpeechSynthesisUtterance(displayChunks[readableIndex].text.trim());
       const voice = voices.find((voiceItem) => voiceItem.voiceURI === selectedVoice);
       if (voice) {
         utterance.voice = voice;
@@ -168,22 +185,23 @@ export default function AudioReader() {
       }
       utterance.rate = rate;
       utterance.onend = () => {
-        setCurrentIndex((previous) => {
-          const next = previous + 1;
-          if (next < displayChunks.length) {
-            window.setTimeout(() => speakChunk(next), 80);
-          } else {
-            setIsPlaying(false);
-            setIsPaused(false);
-          }
-          return Math.min(next, displayChunks.length - 1);
-        });
+        const next = findReadableChunk(readableIndex + 1);
+        if (next >= 0) {
+          window.setTimeout(() => speakChunkRef.current(next), CHUNK_DELAY_MS);
+          return;
+        }
+        setIsPlaying(false);
+        setIsPaused(false);
       };
 
       window.speechSynthesis.speak(utterance);
     },
-    [displayChunks, rate, selectedVoice, voices],
+    [displayChunks, findReadableChunk, rate, selectedVoice, voices],
   );
+
+  useEffect(() => {
+    speakChunkRef.current = speakChunk;
+  }, [speakChunk]);
 
   const jumpToChunk = useCallback(
     (index: number) => {
@@ -253,7 +271,8 @@ export default function AudioReader() {
   };
 
   const moveChunk = (offset: number) => {
-    jumpToChunk(Math.max(0, Math.min(displayChunks.length - 1, currentIndex + offset)));
+    const target = findReadableChunk(currentIndex + offset, offset >= 0 ? 1 : -1);
+    if (target >= 0) jumpToChunk(target);
   };
 
   return (
