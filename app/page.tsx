@@ -245,7 +245,6 @@ export default function AudioReader() {
   const [authLoading, setAuthLoading] = useState(SUPABASE_CONFIGURED);
   const [authUser, setAuthUser] = useState<User | null>(null);
   const [authEmail, setAuthEmail] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
   const [authMessage, setAuthMessage] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [text, setText] = useState("");
@@ -756,18 +755,6 @@ export default function AudioReader() {
   const signedInEmail = authUser?.email?.toLowerCase() ?? "";
   const isAllowedUser = Boolean(authUser) && (ALLOWED_EMAILS.length === 0 || ALLOWED_EMAILS.includes(signedInEmail));
 
-  const signInWithPassword = async () => {
-    if (!supabase || !authEmail.trim() || !authPassword) return;
-    setAuthBusy(true);
-    setAuthMessage("");
-    const { error } = await supabase.auth.signInWithPassword({
-      email: authEmail.trim(),
-      password: authPassword,
-    });
-    setAuthBusy(false);
-    setAuthMessage(error ? error.message : "เข้าสู่ระบบสำเร็จ");
-  };
-
   const sendMagicLink = async () => {
     if (!supabase || !authEmail.trim()) return;
     setAuthBusy(true);
@@ -859,30 +846,16 @@ NEXT_PUBLIC_ALLOWED_EMAILS=your@email.com`}
                 type="email"
                 value={authEmail}
                 onChange={(event) => setAuthEmail(event.target.value)}
+                onKeyDown={(event) => event.key === "Enter" && sendMagicLink()}
                 placeholder="email"
                 className="w-full rounded border border-[#d7ad65]/25 bg-[#090807] px-4 py-3 text-sm text-[#f3ead7] outline-none focus:border-[#d7ad65]"
               />
-              <input
-                type="password"
-                value={authPassword}
-                onChange={(event) => setAuthPassword(event.target.value)}
-                onKeyDown={(event) => event.key === "Enter" && signInWithPassword()}
-                placeholder="password"
-                className="w-full rounded border border-[#d7ad65]/25 bg-[#090807] px-4 py-3 text-sm text-[#f3ead7] outline-none focus:border-[#d7ad65]"
-              />
-              <button
-                onClick={signInWithPassword}
-                disabled={authBusy}
-                className="w-full rounded bg-[#d7ad65] px-5 py-3 text-sm font-black text-[#17100c] transition hover:bg-[#f0c97f] disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {authBusy ? "กำลังเข้าสู่ระบบ..." : "เข้าสู่ระบบ"}
-              </button>
               <button
                 onClick={sendMagicLink}
                 disabled={authBusy}
-                className="w-full rounded border border-[#d7ad65]/40 px-5 py-3 text-sm font-bold text-[#ffe2a3] transition hover:bg-[#d7ad65]/10 disabled:cursor-not-allowed disabled:opacity-60"
+                className="w-full rounded bg-[#d7ad65] px-5 py-3 text-sm font-black text-[#17100c] transition hover:bg-[#f0c97f] disabled:cursor-not-allowed disabled:opacity-60"
               >
-                ส่ง Magic Link
+                {authBusy ? "กำลังส่งลิงก์..." : "ส่งลิงก์เข้าสู่ระบบ"}
               </button>
             </div>
             {authMessage && <p className="mt-4 text-sm leading-6 text-[#c9baa2]">{authMessage}</p>}
