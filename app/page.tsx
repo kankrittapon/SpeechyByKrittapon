@@ -16,6 +16,7 @@ const VISIBLE_BEFORE = 80;
 const VISIBLE_AFTER = 180;
 const VISIBLE_EXPAND_STEP = 120;
 const LARGE_FILE_WINDOW_THRESHOLD = 2000;
+const READER_STORAGE_BUCKET = "reader-texts";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
 const SUPABASE_CONFIGURED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
@@ -80,6 +81,7 @@ interface ReaderDocument {
   user_id: string;
   file_hash: string;
   file_name: string;
+  storage_path: string | null;
   text_length: number;
   readable_count: number;
   display_count: number;
@@ -101,6 +103,10 @@ interface PendingResume {
   displayIndex: number;
   readableIndex: number;
   source: "local" | "cloud";
+}
+
+interface ProcessTextOptions {
+  cloudDocument?: ReaderDocument;
 }
 
 interface VisibleWindow {
@@ -220,6 +226,8 @@ const saveResumeSession = (session: ResumeSession) => {
   writeResumeSessions([session, ...otherSessions]);
 };
 
+const buildStoragePath = (userId: string, documentId: string) => `${userId}/${documentId}.txt`;
+
 const buildResumeFromCloud = (
   document: ReaderDocument,
   progress: ReaderProgress,
@@ -304,6 +312,8 @@ export default function AudioReader() {
   const [fileName, setFileName] = useState("");
   const [fileHash, setFileHash] = useState("");
   const [activeDocumentId, setActiveDocumentId] = useState("");
+  const [recentDocuments, setRecentDocuments] = useState<ReaderDocument[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null);
   const [visibleWindow, setVisibleWindow] = useState<VisibleWindow>(() =>
     clampVisibleWindow(0, 0, VISIBLE_BEFORE, VISIBLE_AFTER),
@@ -404,6 +414,36 @@ export default function AudioReader() {
   useEffect(() => {
     currentReadableIndexRef.current = currentReadableIndex;
   }, [currentReadableIndex]);
+
+  const loadRecentDocuments = useCallback(async () => {
+    if (!supabase || !authUser) return;
+
+    const { data, error } = await supabase
+      .from("reader_documents")
+      .select()
+      .eq("user_id", authUser.id)
+      .not("storage_path", "is", null)
+      .order("updated_at", { ascending: false })
+      .limit(8)
+      .returns<ReaderDocument[]>();
+
+    if (error) {
+      console.warn("Supabase reader library load failed", error);
+      return;
+    }
+
+    setRecentDocuments(data ?? []);
+  }, [authUser, supabase]);
+
+  useEffect(() => {
+    if (!authUser) return;
+
+    const timeoutId = window.setTimeout(() => {
+      void loadRecentDocuments();
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [authUser, loadRecentDocuments]);
 
   useEffect(() => {
     if (!fileHash || !readableChunks.length) return;
@@ -591,20 +631,22 @@ export default function AudioReader() {
     [centerVisibleWindow, displayChunks, readableChunks],
   );
 
-  const processText = useCallback(async (rawText: string, sourceName = "ข้อความที่วาง") => {
+  const processText = useCallback(async (rawText: string, sourceName = "ข้อความที่วาง", options: ProcessTextOptions = {}) => {
     const processed = buildProcessedText(rawText);
     if (!processed.text || processed.readableChunks.length === 0) {
       setNotice("ยังไม่มีข้อความให้อ่าน");
       return;
     }
 
-    const nextFileHash = hashText(`${sourceName}:${processed.text.length}:${processed.text.slice(0, 5000)}`);
+    const cloudDocument = options.cloudDocument;
+    const nextFileHash = cloudDocument?.file_hash ?? hashText(`${sourceName}:${processed.text.length}:${processed.text.slice(0, 5000)}`);
     const localSession = findResumeSession(nextFileHash);
     let previousSession = localSession;
     let resumeSource: PendingResume["source"] = "local";
-    let nextDocumentId = "";
+    let activeDocument = cloudDocument ?? null;
+    let nextDocumentId = cloudDocument?.id ?? "";
 
-    if (supabase && authUser) {
+    if (supabase && authUser && !cloudDocument) {
       const { data: document, error: documentError } = await supabase
         .from("reader_documents")
         .upsert(
@@ -625,22 +667,54 @@ export default function AudioReader() {
         console.warn("Supabase reader document sync failed", documentError);
         cloudSyncWarningShownRef.current = true;
       } else if (document) {
+        activeDocument = document;
         nextDocumentId = document.id;
+        const storagePath = document.storage_path ?? buildStoragePath(authUser.id, document.id);
+        const textBlob = new Blob([processed.text], { type: "text/plain" });
+        const { error: uploadError } = await supabase.storage
+          .from(READER_STORAGE_BUCKET)
+          .upload(storagePath, textBlob, {
+            cacheControl: "3600",
+            contentType: "text/plain",
+            upsert: true,
+          });
 
-        const { data: cloudProgress, error: progressError } = await supabase
-          .from("reader_progress")
-          .select()
-          .eq("document_id", document.id)
-          .eq("user_id", authUser.id)
-          .maybeSingle<ReaderProgress>();
-
-        if (progressError) {
-          console.warn("Supabase reader progress load failed", progressError);
+        if (uploadError) {
+          console.warn("Supabase reader text upload failed", uploadError);
           cloudSyncWarningShownRef.current = true;
-        } else if (cloudProgress) {
-          previousSession = buildResumeFromCloud(document, cloudProgress, sourceName);
-          resumeSource = "cloud";
+        } else if (!document.storage_path) {
+          const { data: updatedDocument, error: updateError } = await supabase
+            .from("reader_documents")
+            .update({ storage_path: storagePath })
+            .eq("id", document.id)
+            .eq("user_id", authUser.id)
+            .select()
+            .single<ReaderDocument>();
+
+          if (updateError) {
+            console.warn("Supabase reader storage path update failed", updateError);
+            cloudSyncWarningShownRef.current = true;
+          } else if (updatedDocument) {
+            activeDocument = updatedDocument;
+          }
         }
+      }
+    }
+
+    if (supabase && authUser && activeDocument) {
+      const { data: cloudProgress, error: progressError } = await supabase
+        .from("reader_progress")
+        .select()
+        .eq("document_id", activeDocument.id)
+        .eq("user_id", authUser.id)
+        .maybeSingle<ReaderProgress>();
+
+      if (progressError) {
+        console.warn("Supabase reader progress load failed", progressError);
+        cloudSyncWarningShownRef.current = true;
+      } else if (cloudProgress) {
+        previousSession = buildResumeFromCloud(activeDocument, cloudProgress, sourceName);
+        resumeSource = "cloud";
       }
     }
 
@@ -653,7 +727,7 @@ export default function AudioReader() {
     clearSpeechTimers();
     activeUtteranceRef.current = null;
     setText(processed.text);
-    setFileName(sourceName);
+    setFileName(activeDocument?.file_name ?? sourceName);
     setFileHash(nextFileHash);
     setActiveDocumentId(nextDocumentId);
     setDisplayChunks(processed.displayChunks);
@@ -682,12 +756,13 @@ export default function AudioReader() {
       setNotice("โหลดไฟล์ได้แล้ว แต่ยังเชื่อม Supabase session ไม่สำเร็จ ตรวจสอบ SQL Phase 2");
       return;
     }
+    if (nextDocumentId) void loadRecentDocuments();
     setNotice(
       `โหลดแล้ว ${processed.text.length.toLocaleString()} ตัวอักษร · อ่านได้ ${processed.readableChunks.length.toLocaleString()} ช่วง${
         cleanSummary.length ? ` · ${cleanSummary.join(" · ")}` : ""
       }${previousSession && safeResumeIndex > 0 ? ` · พบตำแหน่งอ่านล่าสุด${resumeSource === "cloud" ? "บน Supabase" : ""}` : ""}`,
     );
-  }, [authUser, clearSpeechTimers, supabase]);
+  }, [authUser, clearSpeechTimers, loadRecentDocuments, supabase]);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -704,6 +779,24 @@ export default function AudioReader() {
     };
     reader.onerror = () => setNotice("อ่านไฟล์ไม่สำเร็จ ลองเลือกไฟล์อีกครั้ง");
     reader.readAsText(file);
+  };
+
+  const openLibraryDocument = async (document: ReaderDocument) => {
+    if (!supabase || !document.storage_path) return;
+
+    setLibraryLoading(true);
+    setNotice(`กำลังเปิด ${document.file_name} จากคลังไฟล์...`);
+    const { data, error } = await supabase.storage.from(READER_STORAGE_BUCKET).download(document.storage_path);
+    setLibraryLoading(false);
+
+    if (error || !data) {
+      console.warn("Supabase reader text download failed", error);
+      setNotice("เปิดไฟล์จากคลังไม่สำเร็จ ตรวจสอบ Storage policy หรืออัปโหลดไฟล์นี้ใหม่อีกครั้ง");
+      return;
+    }
+
+    const cloudText = await data.text();
+    await processText(cloudText, document.file_name, { cloudDocument: document });
   };
 
   const speakChunk = useCallback(
@@ -899,6 +992,7 @@ export default function AudioReader() {
     stopReading();
     await supabase?.auth.signOut();
     setActiveDocumentId("");
+    setRecentDocuments([]);
     setAuthMessage("ออกจากระบบแล้ว");
   };
 
@@ -1078,6 +1172,43 @@ NEXT_PUBLIC_SITE_URL=https://your-domain.com`}
                 >
                   เปิดตัวอย่าง
                 </button>
+              </div>
+              <div className="mt-8 border-t border-[#d7ad65]/15 pt-5">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <p className="text-sm font-semibold text-[#d7ad65]">คลังไฟล์ล่าสุด</p>
+                  <button
+                    onClick={() => {
+                      void loadRecentDocuments();
+                    }}
+                    disabled={libraryLoading}
+                    className="rounded border border-[#d7ad65]/30 px-3 py-1.5 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    รีเฟรช
+                  </button>
+                </div>
+                {recentDocuments.length === 0 ? (
+                  <p className="rounded border border-[#d7ad65]/15 bg-black/25 p-3 text-sm leading-6 text-[#8f816d]">
+                    ยังไม่มีไฟล์ในคลัง หลังอัปโหลดไฟล์ .txt ครั้งแรก ระบบจะเก็บไว้ให้เปิดอ่านต่อจาก cloud
+                  </p>
+                ) : (
+                  <div className="bdo-scrollbar max-h-[260px] space-y-2 overflow-y-auto pr-1">
+                    {recentDocuments.map((document) => (
+                      <button
+                        key={document.id}
+                        onClick={() => {
+                          void openLibraryDocument(document);
+                        }}
+                        disabled={libraryLoading}
+                        className="w-full rounded border border-[#d7ad65]/15 bg-black/25 p-3 text-left transition hover:border-[#d7ad65]/45 hover:bg-[#d7ad65]/10 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <span className="block truncate text-sm font-bold text-[#fff6df]">{document.file_name}</span>
+                        <span className="mt-1 block text-xs text-[#a99a82]">
+                          {document.readable_count.toLocaleString()} ช่วงอ่าน · {new Date(document.updated_at).toLocaleString("th-TH")}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
 
