@@ -313,6 +313,11 @@ export default function AudioReader() {
   const [fileHash, setFileHash] = useState("");
   const [activeDocumentId, setActiveDocumentId] = useState("");
   const [recentDocuments, setRecentDocuments] = useState<ReaderDocument[]>([]);
+  const [documentProgress, setDocumentProgress] = useState<Record<string, ReaderProgress>>({});
+  const [libraryQuery, setLibraryQuery] = useState("");
+  const [renamingDocumentId, setRenamingDocumentId] = useState("");
+  const [renameValue, setRenameValue] = useState("");
+  const [libraryBusyId, setLibraryBusyId] = useState("");
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null);
   const [visibleWindow, setVisibleWindow] = useState<VisibleWindow>(() =>
@@ -432,7 +437,33 @@ export default function AudioReader() {
       return;
     }
 
-    setRecentDocuments(data ?? []);
+    const documents = data ?? [];
+    setRecentDocuments(documents);
+
+    if (!documents.length) {
+      setDocumentProgress({});
+      return;
+    }
+
+    const documentIds = documents.map((document) => document.id);
+    const { data: progressRows, error: progressError } = await supabase
+      .from("reader_progress")
+      .select()
+      .eq("user_id", authUser.id)
+      .in("document_id", documentIds)
+      .returns<ReaderProgress[]>();
+
+    if (progressError) {
+      console.warn("Supabase reader library progress load failed", progressError);
+      return;
+    }
+
+    setDocumentProgress(
+      (progressRows ?? []).reduce<Record<string, ReaderProgress>>((progressByDocument, progressRow) => {
+        progressByDocument[progressRow.document_id] = progressRow;
+        return progressByDocument;
+      }, {}),
+    );
   }, [authUser, supabase]);
 
   useEffect(() => {
@@ -536,6 +567,23 @@ export default function AudioReader() {
   const currentVoiceName = useMemo(() => {
     return voices.find((voice) => voice.voiceURI === selectedVoice)?.name ?? "ยังไม่พบเสียงอ่าน";
   }, [selectedVoice, voices]);
+
+  const filteredDocuments = useMemo(() => {
+    const query = libraryQuery.trim().toLowerCase();
+    if (!query) return recentDocuments;
+    return recentDocuments.filter((document) => document.file_name.toLowerCase().includes(query));
+  }, [libraryQuery, recentDocuments]);
+
+  const getDocumentProgress = useCallback(
+    (document: ReaderDocument) => {
+      const progressRow = documentProgress[document.id];
+      if (!progressRow || document.readable_count <= 0) return 0;
+      return Math.min(100, Math.round(((progressRow.current_readable_index + 1) / document.readable_count) * 100));
+    },
+    [documentProgress],
+  );
+
+  const playButtonLabel = isPlaying && !isPaused ? "พัก" : isPaused ? "อ่านต่อ" : "เริ่มอ่าน";
 
   const clearSpeechTimers = useCallback(() => {
     if (watchdogTimerRef.current !== null) {
@@ -784,9 +832,11 @@ export default function AudioReader() {
   const openLibraryDocument = async (document: ReaderDocument) => {
     if (!supabase || !document.storage_path) return;
 
+    setLibraryBusyId(document.id);
     setLibraryLoading(true);
     setNotice(`กำลังเปิด ${document.file_name} จากคลังไฟล์...`);
     const { data, error } = await supabase.storage.from(READER_STORAGE_BUCKET).download(document.storage_path);
+    setLibraryBusyId("");
     setLibraryLoading(false);
 
     if (error || !data) {
@@ -797,6 +847,82 @@ export default function AudioReader() {
 
     const cloudText = await data.text();
     await processText(cloudText, document.file_name, { cloudDocument: document });
+  };
+
+  const startRenameDocument = (document: ReaderDocument) => {
+    setRenamingDocumentId(document.id);
+    setRenameValue(document.file_name);
+  };
+
+  const cancelRenameDocument = () => {
+    setRenamingDocumentId("");
+    setRenameValue("");
+  };
+
+  const saveRenameDocument = async (document: ReaderDocument) => {
+    if (!supabase || !authUser) return;
+
+    const nextName = renameValue.trim();
+    if (!nextName) {
+      setNotice("ชื่อไฟล์ห้ามว่าง");
+      return;
+    }
+
+    setLibraryBusyId(document.id);
+    const { error } = await supabase
+      .from("reader_documents")
+      .update({ file_name: nextName })
+      .eq("id", document.id)
+      .eq("user_id", authUser.id);
+    setLibraryBusyId("");
+
+    if (error) {
+      console.warn("Supabase reader rename failed", error);
+      setNotice("เปลี่ยนชื่อไฟล์ไม่สำเร็จ");
+      return;
+    }
+
+    if (activeDocumentId === document.id) setFileName(nextName);
+    cancelRenameDocument();
+    setNotice(`เปลี่ยนชื่อเป็น ${nextName} แล้ว`);
+    void loadRecentDocuments();
+  };
+
+  const deleteLibraryDocument = async (document: ReaderDocument) => {
+    if (!supabase || !authUser) return;
+    const confirmed = window.confirm(`ลบ "${document.file_name}" ออกจากคลังไฟล์?`);
+    if (!confirmed) return;
+
+    setLibraryBusyId(document.id);
+    if (document.storage_path) {
+      const { error: storageError } = await supabase.storage.from(READER_STORAGE_BUCKET).remove([document.storage_path]);
+      if (storageError) console.warn("Supabase reader storage delete failed", storageError);
+    }
+
+    await supabase.from("reader_progress").delete().eq("document_id", document.id).eq("user_id", authUser.id);
+    const { error } = await supabase.from("reader_documents").delete().eq("id", document.id).eq("user_id", authUser.id);
+    setLibraryBusyId("");
+
+    if (error) {
+      console.warn("Supabase reader document delete failed", error);
+      setNotice("ลบไฟล์ไม่สำเร็จ");
+      return;
+    }
+
+    if (activeDocumentId === document.id) {
+      stopReading();
+      setText("");
+      setDisplayChunks([]);
+      setReadableChunks([]);
+      setToc([]);
+      setFileName("");
+      setFileHash("");
+      setActiveDocumentId("");
+      setPendingResume(null);
+    }
+
+    setNotice(`ลบ ${document.file_name} แล้ว`);
+    void loadRecentDocuments();
   };
 
   const speakChunk = useCallback(
@@ -993,6 +1119,7 @@ export default function AudioReader() {
     await supabase?.auth.signOut();
     setActiveDocumentId("");
     setRecentDocuments([]);
+    setDocumentProgress({});
     setAuthMessage("ออกจากระบบแล้ว");
   };
 
@@ -1186,27 +1313,102 @@ NEXT_PUBLIC_SITE_URL=https://your-domain.com`}
                     รีเฟรช
                   </button>
                 </div>
+                <input
+                  type="text"
+                  value={libraryQuery}
+                  onChange={(event) => setLibraryQuery(event.target.value)}
+                  placeholder="ค้นหาชื่อไฟล์ในคลัง"
+                  className="mb-3 w-full rounded border border-[#d7ad65]/20 bg-[#090807] px-3 py-2 text-sm text-[#f3ead7] outline-none placeholder:text-[#776b5b] focus:border-[#d7ad65]"
+                />
                 {recentDocuments.length === 0 ? (
                   <p className="rounded border border-[#d7ad65]/15 bg-black/25 p-3 text-sm leading-6 text-[#8f816d]">
                     ยังไม่มีไฟล์ในคลัง หลังอัปโหลดไฟล์ .txt ครั้งแรก ระบบจะเก็บไว้ให้เปิดอ่านต่อจาก cloud
                   </p>
+                ) : filteredDocuments.length === 0 ? (
+                  <p className="rounded border border-[#d7ad65]/15 bg-black/25 p-3 text-sm leading-6 text-[#8f816d]">
+                    ไม่พบไฟล์ที่ตรงกับคำค้น
+                  </p>
                 ) : (
                   <div className="bdo-scrollbar max-h-[260px] space-y-2 overflow-y-auto pr-1">
-                    {recentDocuments.map((document) => (
-                      <button
-                        key={document.id}
-                        onClick={() => {
-                          void openLibraryDocument(document);
-                        }}
-                        disabled={libraryLoading}
-                        className="w-full rounded border border-[#d7ad65]/15 bg-black/25 p-3 text-left transition hover:border-[#d7ad65]/45 hover:bg-[#d7ad65]/10 disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        <span className="block truncate text-sm font-bold text-[#fff6df]">{document.file_name}</span>
-                        <span className="mt-1 block text-xs text-[#a99a82]">
-                          {document.readable_count.toLocaleString()} ช่วงอ่าน · {new Date(document.updated_at).toLocaleString("th-TH")}
-                        </span>
-                      </button>
-                    ))}
+                    {filteredDocuments.map((document) => {
+                      const libraryProgress = getDocumentProgress(document);
+                      const isRenaming = renamingDocumentId === document.id;
+                      const isBusy = libraryBusyId === document.id;
+
+                      return (
+                        <div
+                          key={document.id}
+                          className="rounded border border-[#d7ad65]/15 bg-black/25 p-3 transition hover:border-[#d7ad65]/45 hover:bg-[#d7ad65]/10"
+                        >
+                          {isRenaming ? (
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                value={renameValue}
+                                onChange={(event) => setRenameValue(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") void saveRenameDocument(document);
+                                  if (event.key === "Escape") cancelRenameDocument();
+                                }}
+                                className="min-w-0 flex-1 rounded border border-[#d7ad65]/25 bg-[#090807] px-3 py-2 text-sm text-[#f3ead7] outline-none focus:border-[#d7ad65]"
+                              />
+                              <button
+                                onClick={() => {
+                                  void saveRenameDocument(document);
+                                }}
+                                disabled={isBusy}
+                                className="rounded bg-[#d7ad65] px-3 text-xs font-black text-[#17100c] disabled:opacity-60"
+                              >
+                                บันทึก
+                              </button>
+                              <button
+                                onClick={cancelRenameDocument}
+                                className="rounded border border-[#d7ad65]/30 px-3 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
+                              >
+                                ยกเลิก
+                              </button>
+                            </div>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => {
+                                  void openLibraryDocument(document);
+                                }}
+                                disabled={libraryLoading}
+                                className="w-full text-left disabled:cursor-not-allowed disabled:opacity-60"
+                              >
+                                <span className="block truncate text-sm font-bold text-[#fff6df]">{document.file_name}</span>
+                                <span className="mt-1 block text-xs text-[#a99a82]">
+                                  {document.readable_count.toLocaleString()} ช่วงอ่าน · อ่านแล้ว {libraryProgress}% ·{" "}
+                                  {new Date(document.updated_at).toLocaleString("th-TH")}
+                                </span>
+                              </button>
+                              <div className="mt-3 h-1.5 overflow-hidden rounded bg-black/50">
+                                <div className="h-full bg-[#d7ad65]" style={{ width: `${libraryProgress}%` }} />
+                              </div>
+                              <div className="mt-3 flex gap-2">
+                                <button
+                                  onClick={() => startRenameDocument(document)}
+                                  disabled={isBusy}
+                                  className="rounded border border-[#d7ad65]/25 px-3 py-1.5 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10 disabled:opacity-60"
+                                >
+                                  เปลี่ยนชื่อ
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    void deleteLibraryDocument(document);
+                                  }}
+                                  disabled={isBusy}
+                                  className="rounded border border-red-400/30 px-3 py-1.5 text-xs font-bold text-red-200 hover:bg-red-500/10 disabled:opacity-60"
+                                >
+                                  ลบ
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1317,7 +1519,7 @@ NEXT_PUBLIC_SITE_URL=https://your-domain.com`}
                     ก่อนหน้า
                   </button>
                   <button onClick={togglePlay} className="rounded bg-[#d7ad65] px-6 py-2 text-sm font-black text-[#17100c] hover:bg-[#f0c97f]">
-                    {isPlaying && !isPaused ? "พัก" : isPaused ? "อ่านต่อ" : "เริ่มอ่าน"}
+                    {playButtonLabel}
                   </button>
                   <button onClick={stopReading} className="rounded border border-[#d7ad65]/30 px-4 py-2 text-sm text-[#ffe2a3] hover:bg-[#d7ad65]/10">
                     หยุด
@@ -1414,6 +1616,48 @@ NEXT_PUBLIC_SITE_URL=https://your-domain.com`}
                 )}
               </div>
             </section>
+          </div>
+        )}
+
+        {displayChunks.length > 0 && (
+          <div className="sticky bottom-4 z-30 mx-auto w-full max-w-3xl rounded border border-[#d7ad65]/35 bg-[#0c0907]/95 p-3 shadow-2xl shadow-black/60 backdrop-blur">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <p className="truncate text-sm font-bold text-[#fff6df]">{fileName || "กำลังอ่าน"}</p>
+                <p className="mt-1 text-xs text-[#a99a82]">
+                  {readingRangeText} · {progress}% · {isPlaying && !isPaused ? "กำลังอ่าน" : isPaused ? "พักอยู่" : "พร้อมอ่าน"}
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  onClick={() => moveChunk(-1)}
+                  className="rounded border border-[#d7ad65]/30 px-3 py-2 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
+                >
+                  ก่อนหน้า
+                </button>
+                <button
+                  onClick={togglePlay}
+                  className="rounded bg-[#d7ad65] px-5 py-2 text-sm font-black text-[#17100c] hover:bg-[#f0c97f]"
+                >
+                  {playButtonLabel}
+                </button>
+                <button
+                  onClick={stopReading}
+                  className="rounded border border-[#d7ad65]/30 px-3 py-2 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
+                >
+                  หยุด
+                </button>
+                <button
+                  onClick={() => moveChunk(1)}
+                  className="rounded border border-[#d7ad65]/30 px-3 py-2 text-xs font-bold text-[#ffe2a3] hover:bg-[#d7ad65]/10"
+                >
+                  ถัดไป
+                </button>
+              </div>
+            </div>
+            <div className="mt-3 h-1 overflow-hidden rounded bg-black/60">
+              <div className="h-full bg-gradient-to-r from-[#7a562d] via-[#d7ad65] to-[#fff0bd]" style={{ width: `${progress}%` }} />
+            </div>
           </div>
         )}
       </section>
