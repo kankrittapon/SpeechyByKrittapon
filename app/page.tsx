@@ -75,10 +75,32 @@ interface ResumeSession {
   updatedAt: string;
 }
 
+interface ReaderDocument {
+  id: string;
+  user_id: string;
+  file_hash: string;
+  file_name: string;
+  text_length: number;
+  readable_count: number;
+  display_count: number;
+  updated_at: string;
+}
+
+interface ReaderProgress {
+  document_id: string;
+  user_id: string;
+  current_readable_index: number;
+  current_display_index: number;
+  rate: number;
+  voice_uri: string;
+  updated_at: string;
+}
+
 interface PendingResume {
   session: ResumeSession;
   displayIndex: number;
   readableIndex: number;
+  source: "local" | "cloud";
 }
 
 interface VisibleWindow {
@@ -198,6 +220,22 @@ const saveResumeSession = (session: ResumeSession) => {
   writeResumeSessions([session, ...otherSessions]);
 };
 
+const buildResumeFromCloud = (
+  document: ReaderDocument,
+  progress: ReaderProgress,
+  fallbackFileName: string,
+): ResumeSession => ({
+  fileHash: document.file_hash,
+  fileName: document.file_name || fallbackFileName,
+  textLength: document.text_length,
+  readableCount: document.readable_count,
+  currentReadableIndex: progress.current_readable_index,
+  currentDisplayIndex: progress.current_display_index,
+  rate: Number(progress.rate) || 1,
+  voiceURI: progress.voice_uri,
+  updatedAt: progress.updated_at,
+});
+
 const buildProcessedText = (rawText: string): ProcessedText => {
   const stats = blankStats();
   const text = normalizeUploadedText(rawText, stats);
@@ -265,6 +303,7 @@ export default function AudioReader() {
   const [notice, setNotice] = useState("พร้อมรับไฟล์ .txt หรือวางข้อความเพื่อเริ่มอ่าน");
   const [fileName, setFileName] = useState("");
   const [fileHash, setFileHash] = useState("");
+  const [activeDocumentId, setActiveDocumentId] = useState("");
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null);
   const [visibleWindow, setVisibleWindow] = useState<VisibleWindow>(() =>
     clampVisibleWindow(0, 0, VISIBLE_BEFORE, VISIBLE_AFTER),
@@ -279,6 +318,7 @@ export default function AudioReader() {
   const isPausedRef = useRef(false);
   const currentReadableIndexRef = useRef(0);
   const pendingScrollIndexRef = useRef<number | null>(null);
+  const cloudSyncWarningShownRef = useRef(false);
 
   useEffect(() => {
     if (!supabase) {
@@ -379,6 +419,42 @@ export default function AudioReader() {
       updatedAt: new Date().toISOString(),
     });
   }, [currentIndex, currentReadableIndex, fileHash, fileName, rate, readableChunks.length, selectedVoice, text.length]);
+
+  useEffect(() => {
+    if (!supabase || !authUser || !activeDocumentId || !fileHash || !readableChunks.length) return;
+
+    const timeoutId = window.setTimeout(async () => {
+      const { error } = await supabase.from("reader_progress").upsert(
+        {
+          document_id: activeDocumentId,
+          user_id: authUser.id,
+          current_readable_index: currentReadableIndex,
+          current_display_index: currentIndex,
+          rate,
+          voice_uri: selectedVoice,
+        },
+        { onConflict: "document_id" },
+      );
+
+      if (error && !cloudSyncWarningShownRef.current) {
+        cloudSyncWarningShownRef.current = true;
+        console.warn("Supabase reader progress sync failed", error);
+        setNotice("อ่านได้ตามปกติ แต่ยังบันทึกขึ้น Supabase ไม่สำเร็จ ตรวจสอบว่าได้รัน SQL Phase 2 แล้ว");
+      }
+    }, 900);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [
+    activeDocumentId,
+    authUser,
+    currentIndex,
+    currentReadableIndex,
+    fileHash,
+    rate,
+    readableChunks.length,
+    selectedVoice,
+    supabase,
+  ]);
 
   const centerVisibleWindow = useCallback((displayIndex: number, shouldScroll = true) => {
     setVisibleWindow((previous) => clampVisibleWindow(displayIndex, displayChunks.length, previous.before, previous.after));
@@ -515,7 +591,7 @@ export default function AudioReader() {
     [centerVisibleWindow, displayChunks, readableChunks],
   );
 
-  const processText = useCallback((rawText: string, sourceName = "ข้อความที่วาง") => {
+  const processText = useCallback(async (rawText: string, sourceName = "ข้อความที่วาง") => {
     const processed = buildProcessedText(rawText);
     if (!processed.text || processed.readableChunks.length === 0) {
       setNotice("ยังไม่มีข้อความให้อ่าน");
@@ -523,7 +599,51 @@ export default function AudioReader() {
     }
 
     const nextFileHash = hashText(`${sourceName}:${processed.text.length}:${processed.text.slice(0, 5000)}`);
-    const previousSession = findResumeSession(nextFileHash);
+    const localSession = findResumeSession(nextFileHash);
+    let previousSession = localSession;
+    let resumeSource: PendingResume["source"] = "local";
+    let nextDocumentId = "";
+
+    if (supabase && authUser) {
+      const { data: document, error: documentError } = await supabase
+        .from("reader_documents")
+        .upsert(
+          {
+            user_id: authUser.id,
+            file_hash: nextFileHash,
+            file_name: sourceName,
+            text_length: processed.text.length,
+            readable_count: processed.readableChunks.length,
+            display_count: processed.displayChunks.length,
+          },
+          { onConflict: "user_id,file_hash" },
+        )
+        .select()
+        .single<ReaderDocument>();
+
+      if (documentError) {
+        console.warn("Supabase reader document sync failed", documentError);
+        cloudSyncWarningShownRef.current = true;
+      } else if (document) {
+        nextDocumentId = document.id;
+
+        const { data: cloudProgress, error: progressError } = await supabase
+          .from("reader_progress")
+          .select()
+          .eq("document_id", document.id)
+          .eq("user_id", authUser.id)
+          .maybeSingle<ReaderProgress>();
+
+        if (progressError) {
+          console.warn("Supabase reader progress load failed", progressError);
+          cloudSyncWarningShownRef.current = true;
+        } else if (cloudProgress) {
+          previousSession = buildResumeFromCloud(document, cloudProgress, sourceName);
+          resumeSource = "cloud";
+        }
+      }
+    }
+
     const safeResumeIndex = previousSession
       ? Math.min(previousSession.currentReadableIndex, processed.readableChunks.length - 1)
       : -1;
@@ -535,6 +655,7 @@ export default function AudioReader() {
     setText(processed.text);
     setFileName(sourceName);
     setFileHash(nextFileHash);
+    setActiveDocumentId(nextDocumentId);
     setDisplayChunks(processed.displayChunks);
     setReadableChunks(processed.readableChunks);
     setToc(processed.toc);
@@ -554,15 +675,19 @@ export default function AudioReader() {
     ].filter(Boolean);
     setPendingResume(
       previousSession && safeResumeIndex > 0
-        ? { session: previousSession, displayIndex: safeDisplayIndex, readableIndex: safeResumeIndex }
+        ? { session: previousSession, displayIndex: safeDisplayIndex, readableIndex: safeResumeIndex, source: resumeSource }
         : null,
     );
+    if (!nextDocumentId && supabase && authUser) {
+      setNotice("โหลดไฟล์ได้แล้ว แต่ยังเชื่อม Supabase session ไม่สำเร็จ ตรวจสอบ SQL Phase 2");
+      return;
+    }
     setNotice(
       `โหลดแล้ว ${processed.text.length.toLocaleString()} ตัวอักษร · อ่านได้ ${processed.readableChunks.length.toLocaleString()} ช่วง${
         cleanSummary.length ? ` · ${cleanSummary.join(" · ")}` : ""
-      }${previousSession && safeResumeIndex > 0 ? " · พบตำแหน่งอ่านล่าสุด" : ""}`,
+      }${previousSession && safeResumeIndex > 0 ? ` · พบตำแหน่งอ่านล่าสุด${resumeSource === "cloud" ? "บน Supabase" : ""}` : ""}`,
     );
-  }, [clearSpeechTimers]);
+  }, [authUser, clearSpeechTimers, supabase]);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -574,7 +699,9 @@ export default function AudioReader() {
     }
 
     const reader = new FileReader();
-    reader.onload = (readerEvent) => processText((readerEvent.target?.result as string) ?? "", file.name);
+    reader.onload = (readerEvent) => {
+      void processText((readerEvent.target?.result as string) ?? "", file.name);
+    };
     reader.onerror = () => setNotice("อ่านไฟล์ไม่สำเร็จ ลองเลือกไฟล์อีกครั้ง");
     reader.readAsText(file);
   };
@@ -738,12 +865,12 @@ export default function AudioReader() {
 
   const resumeFromSavedPosition = () => {
     if (!pendingResume) return;
-    const { session, readableIndex } = pendingResume;
+    const { session, readableIndex, source } = pendingResume;
     setRate(session.rate);
     if (session.voiceURI) setSelectedVoice(session.voiceURI);
     jumpToReadableChunk(readableIndex);
     setPendingResume(null);
-    setNotice(`อ่านต่อจากครั้งล่าสุดที่ช่วง ${readableIndex + 1}/${readableChunks.length}`);
+    setNotice(`อ่านต่อจากครั้งล่าสุด${source === "cloud" ? "บน Supabase" : ""}ที่ช่วง ${readableIndex + 1}/${readableChunks.length}`);
   };
 
   const startFromBeginning = () => {
@@ -771,6 +898,7 @@ export default function AudioReader() {
   const signOut = async () => {
     stopReading();
     await supabase?.auth.signOut();
+    setActiveDocumentId("");
     setAuthMessage("ออกจากระบบแล้ว");
   };
 
@@ -943,7 +1071,9 @@ NEXT_PUBLIC_SITE_URL=https://your-domain.com`}
                   <input type="file" accept=".txt,text/plain" onChange={handleFileUpload} className="hidden" />
                 </label>
                 <button
-                  onClick={() => processText(SAMPLE_TEXT)}
+                  onClick={() => {
+                    void processText(SAMPLE_TEXT);
+                  }}
                   className="rounded border border-[#d7ad65]/45 px-5 py-3 text-sm font-bold text-[#ffe2a3] transition hover:border-[#f0c97f] hover:bg-[#d7ad65]/10"
                 >
                   เปิดตัวอย่าง
@@ -961,7 +1091,9 @@ NEXT_PUBLIC_SITE_URL=https://your-domain.com`}
               <div className="mt-3 flex items-center justify-between gap-3">
                 <p className="text-xs text-[#a99a82]">รองรับภาษาไทยและเสียงอ่านที่มีในเครื่อง</p>
                 <button
-                  onClick={() => processText(text)}
+                  onClick={() => {
+                    void processText(text);
+                  }}
                   className="rounded bg-[#f3ead7] px-5 py-2.5 text-sm font-bold text-[#17100c] transition hover:bg-white"
                 >
                   โหลดข้อความ
